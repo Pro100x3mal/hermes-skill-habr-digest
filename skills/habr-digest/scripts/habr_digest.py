@@ -1,26 +1,11 @@
 #!/usr/bin/env python3
+"""Generate and optionally send Habr top-by-views digests.
+
+No credentials or delivery targets are embedded in this file. Telegram token is
+read from HABR_DIGEST_BOT_TOKEN. Chat/thread ids are runtime arguments.
 """
-Habr digest — top-5 Habr articles by views over a period, plus highlight blocks.
+from __future__ import annotations
 
-Article ID/URL list comes from the Habr sitemap
-(https://habr.com/sitemap_articles1.xml) — NOT from search results and NOT from
-the top/daily|weekly|monthly collections. Views / score / date / title /
-description come strictly from the per-article API:
-https://habr.com/kek/v2/articles/<id>/?fl=ru&hl=ru
-
-Periods are computed in Europe/Moscow relative to launch time.
-
-Configuration (no hardcoded chat/thread/token):
-    HABR_DIGEST_BOT_TOKEN   (required) — Telegram bot token
-    HABR_DIGEST_CHAT_ID     (required) — target chat id (e.g. -1001234567890)
-    HABR_DIGEST_THREAD_ID   (optional) — forum topic thread id; omit for General
-
-Usage:
-    habr_digest.py --period daily|weekly|monthly [--dry-run] [--debug]
-
-Cron (no_agent) behaviour: on success prints an empty line (quiet) and sends the
-digest itself via the Bot API. On error: writes to stderr and exits non-zero.
-"""
 import argparse
 import html
 import json
@@ -28,392 +13,441 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Iterable
 
-# ---- Environment / constants ----
-MSK = timezone(timedelta(hours=3))            # Europe/Moscow (fixed +03:00, no DST)
+MSK = timezone(timedelta(hours=3))
 SITEMAP_URL = "https://habr.com/sitemap_articles1.xml"
-ARTICLE_API = "https://habr.com/kek/v2/articles/{id}/?fl=ru&hl=ru"
-ARTICLE_URL = "https://habr.com/ru/articles/{id}/"
-UA = "Mozilla/5.0 (compatible; HabrDigest/1.0)"
-
+ARTICLE_API = "https://habr.com/kek/v2/articles/{article_id}/?fl=ru&hl=ru"
+ARTICLE_URL = "https://habr.com/ru/articles/{article_id}/"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
-
-ENV_TOKEN = "HABR_DIGEST_BOT_TOKEN"
-ENV_CHAT = "HABR_DIGEST_CHAT_ID"
-ENV_THREAD = "HABR_DIGEST_THREAD_ID"
-
-WORKERS = 32
+USER_AGENT = "Mozilla/5.0 (compatible; HermesHabrDigest/1.0)"
 HTTP_TIMEOUT = 20
 MAX_RETRIES = 4
+WORKERS = 64
+RETRY_WORKERS = 16
 TG_LIMIT = 4096
+SEP = "➖➖➖➖➖➖➖➖➖➖➖➖"
+RANKS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+ARTICLE_ID_RE = re.compile(r"/articles/(\d+)/?")
+TOKEN_ENV = "HABR_DIGEST_BOT_TOKEN"
 
-# period -> (summary_days, trend_days|None, kind, period_word, trend_label, top_label)
 PERIODS = {
-    "daily":   (1,  7,    "📅 Daily",   "сутки",  "Тренд недели", "Топ недели"),
-    "weekly":  (7,  30,   "📆 Weekly",  "неделю", "Тренд месяца", "Топ месяца"),
-    "monthly": (30, None, "🗓 Monthly", "месяц",  None,           None),
+    "daily": {
+        "kind": "📅 Daily",
+        "period_word": "сутки",
+        "summary_days": 1,
+        "highlight_days": 7,
+        "trend_label": "Тренд недели",
+        "top_label": "Топ недели",
+    },
+    "weekly": {
+        "kind": "📆 Weekly",
+        "period_word": "неделю",
+        "summary_days": 7,
+        "highlight_days": 30,
+        "trend_label": "Тренд месяца",
+        "top_label": "Топ месяца",
+    },
+    "monthly": {
+        "kind": "🗓 Monthly",
+        "period_word": "месяц",
+        "summary_days": 30,
+        "highlight_days": None,
+        "trend_label": None,
+        "top_label": None,
+    },
 }
-RANK = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 
 
-def log(msg):
-    print(f"[habr-digest] {msg}", file=sys.stderr, flush=True)
+@dataclass(frozen=True)
+class Candidate:
+    article_id: str
+    lastmod: datetime
 
 
-def http_get(url, want_json=False):
-    """GET with retries and exponential backoff."""
-    last = None
+@dataclass(frozen=True)
+class Article:
+    article_id: str
+    title: str
+    description: str
+    published_msk: datetime
+    views: int
+    score: int
+    comments: int
+
+    @property
+    def url(self) -> str:
+        return ARTICLE_URL.format(article_id=self.article_id)
+
+
+FETCH_FAILED = object()
+
+
+def log(message: str) -> None:
+    print(f"[habr-digest] {message}", file=sys.stderr, flush=True)
+
+
+def parse_iso(value: str) -> datetime:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def to_msk(value: str) -> datetime:
+    return parse_iso(value).astimezone(MSK)
+
+
+def request_bytes(url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None) -> bytes:
+    merged_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        merged_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=merged_headers)
+    last_error: BaseException | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-                raw = r.read()
-            return json.loads(raw) if want_json else raw.decode("utf-8", "replace")
-        except Exception as e:  # noqa
-            last = e
-            code = getattr(e, "code", None)
-            # 404 (deleted) / 403 (delisted: AUTHOR_INACTIVE / IN_DRAFTS) —
-            # retrying is pointless, the article is permanently unavailable.
-            if code in (403, 404):
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 404):
                 raise
-            sleep = (2 ** attempt) * 0.5 + (0.1 * attempt)
-            time.sleep(sleep)
-    raise last
+            last_error = exc
+        except Exception as exc:  # noqa: BLE001 - stdlib script, retry transient network errors
+            last_error = exc
+        if attempt < MAX_RETRIES - 1:
+            time.sleep((2**attempt) * 0.5)
+    assert last_error is not None
+    raise last_error
 
 
-# ---- Step 1: sitemap -> candidate IDs filtered by lastmod ----
-def fetch_candidate_ids(fetch_start):
-    """
-    Return article ids whose lastmod >= fetch_start.
-    lastmod >= timePublished always holds, so filtering by lastmod is a safe
-    superset for the desired publication-date window.
-    """
-    xml = http_get(SITEMAP_URL)
-    # Each <url> carries <loc>...</loc> and <lastmod>...</lastmod> in order.
-    pairs = re.findall(
-        r"<loc>(https://habr\.com/[^<]*?/articles/(\d+)/)</loc>\s*"
-        r"<changefreq>[^<]*</changefreq>\s*<priority>[^<]*</priority>\s*"
-        r"<lastmod>([^<]+)</lastmod>",
-        xml,
-    )
-    ids = []
-    for _loc, aid, lastmod in pairs:
-        try:
-            lm = datetime.fromisoformat(lastmod)
-        except ValueError:
-            continue
-        if lm.tzinfo is None:
-            lm = lm.replace(tzinfo=timezone.utc)
-        if lm >= fetch_start:
-            ids.append(aid)
-    # dedup, preserving order
-    seen = set()
-    out = []
-    for a in ids:
-        if a not in seen:
-            seen.add(a)
-            out.append(a)
-    return out
+def request_text(url: str) -> str:
+    return request_bytes(url).decode("utf-8", "replace")
 
 
-# ---- Step 2: per-article API ----
-def clean_text(raw_html, limit=220):
-    if not raw_html:
+def request_json(url: str) -> dict:
+    data = json.loads(request_bytes(url).decode("utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"expected JSON object from {url}")
+    return data
+
+
+def strip_html(raw: str | None) -> str:
+    if not raw:
         return ""
-    txt = re.sub(r"<[^>]+>", "", raw_html)
-    txt = html.unescape(txt)
-    txt = re.sub(r"\s+", " ", txt).strip()
-    if len(txt) > limit:
-        txt = txt[:limit].rstrip() + "…"
-    return txt
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-FETCH_FAILED = object()  # sentinel: network failure (vs None = filtered out)
+def clip(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip(" ,.;:-") + "…"
 
 
-def fetch_article(aid):
-    """Fetch one article.
-    Returns a dict (article), None (filtered: news / missing data) or
-    FETCH_FAILED (network failure after all retries — must be retried in a
-    second pass so a leader article is never silently lost).
-    """
+def fetch_candidates(fetch_start_utc: datetime) -> list[Candidate]:
+    root = ET.fromstring(request_text(SITEMAP_URL))
+    candidates: list[Candidate] = []
+    for node in root.findall("sm:url", NS):
+        loc = (node.findtext("sm:loc", namespaces=NS) or "").strip()
+        match = ARTICLE_ID_RE.search(loc)
+        if not match:
+            continue
+        lastmod_raw = (node.findtext("sm:lastmod", namespaces=NS) or "").strip()
+        if not lastmod_raw:
+            continue
+        lastmod = parse_iso(lastmod_raw)
+        if lastmod >= fetch_start_utc:
+            candidates.append(Candidate(match.group(1), lastmod))
+    by_id = {item.article_id: item for item in candidates}
+    return sorted(by_id.values(), key=lambda item: (item.lastmod, int(item.article_id)), reverse=True)
+
+
+def fetch_article(candidate: Candidate) -> Article | None | object:
     try:
-        d = http_get(ARTICLE_API.format(id=aid), want_json=True)
-    except Exception as e:
-        # 403 / 404 — legitimate skip (article delisted/deleted), not a network
-        # failure: do not retry, do not count as a loss.
-        if getattr(e, "code", None) in (403, 404):
+        payload = request_json(ARTICLE_API.format(article_id=candidate.article_id))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 404):
             return None
         return FETCH_FAILED
-    if not isinstance(d, dict):
+    except Exception:  # noqa: BLE001
         return FETCH_FAILED
-    # Articles only. Drop news (corporate news etc.).
-    if d.get("postType") != "article":
+
+    if payload.get("postType") != "article":
         return None
-    tp = d.get("timePublished")
-    if not tp:
+
+    published_raw = payload.get("timePublished")
+    title = strip_html(payload.get("titleHtml"))
+    if not published_raw or not title:
         return None
+
     try:
-        pub = datetime.fromisoformat(tp)
+        published_msk = to_msk(str(published_raw))
     except ValueError:
         return None
-    if pub.tzinfo is None:
-        pub = pub.replace(tzinfo=timezone.utc)
-    stats = d.get("statistics") or {}
-    title = html.unescape(re.sub(r"<[^>]+>", "", d.get("titleHtml") or "")).strip()
-    if not title:
-        return None
-    meta = d.get("metadata") or {}
-    desc = clean_text(meta.get("metaDescription"))
-    if not desc:
-        desc = clean_text((d.get("leadData") or {}).get("textHtml"))
-    return {
-        "id": aid,
-        "title": title,
-        "desc": desc,
-        "views": int(stats.get("readingCount") or 0),
-        "comments": int(stats.get("commentsCount") or 0),
-        "score": int(stats.get("score") or 0),
-        "pub": pub,                      # aware UTC
-        "pub_msk": pub.astimezone(MSK),
-        "url": ARTICLE_URL.format(id=aid),
-    }
+
+    stats = payload.get("statistics") or {}
+    meta = payload.get("metadata") or {}
+    description = strip_html(meta.get("metaDescription"))
+    if not description:
+        description = strip_html((payload.get("leadData") or {}).get("textHtml"))
+    if not description:
+        description = strip_html(payload.get("textHtml"))
+
+    return Article(
+        article_id=candidate.article_id,
+        title=title,
+        description=description,
+        published_msk=published_msk,
+        views=int(stats.get("readingCount") or 0),
+        score=int(stats.get("score") or 0),
+        comments=int(stats.get("commentsCount") or 0),
+    )
 
 
-def _fetch_pass(ids, workers):
-    """One pass: returns (articles, failed_ids)."""
-    out, failed = [], []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(fetch_article, a): a for a in ids}
-        for f in as_completed(futs):
-            r = f.result()
-            if r is FETCH_FAILED:
-                failed.append(futs[f])
-            elif r:
-                out.append(r)
-    return out, failed
+def fetch_pass(candidates: Iterable[Candidate], workers: int) -> tuple[list[Article], list[Candidate]]:
+    articles: list[Article] = []
+    failed: list[Candidate] = []
+    candidate_list = list(candidates)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_article, item): item for item in candidate_list}
+        for future in as_completed(futures):
+            result = future.result()
+            if result is FETCH_FAILED:
+                failed.append(futures[future])
+            elif isinstance(result, Article):
+                articles.append(result)
+    return articles, failed
 
 
-def fetch_all(ids):
-    """Concurrent fetch with a retry pass for failures. Ensures network
-    failures are not silently dropped — otherwise a top article by views/score
-    could fall out of the result non-deterministically."""
-    out, failed = _fetch_pass(ids, WORKERS)
-    # Retry passes for failed ids — smaller pool (gentler on rate limits).
+def fetch_articles(candidates: list[Candidate]) -> list[Article]:
+    articles, failed = fetch_pass(candidates, WORKERS)
     for attempt in range(2):
         if not failed:
             break
-        log(f"retry pass {attempt+1}: {len(failed)} failed ids, refetch with smaller pool")
+        log(f"retry pass {attempt + 1}: {len(failed)} transient failures")
         time.sleep(2)
-        more, failed = _fetch_pass(failed, max(4, WORKERS // 4))
-        out.extend(more)
+        more, failed = fetch_pass(failed, RETRY_WORKERS)
+        articles.extend(more)
     if failed:
-        log(f"WARNING: {len(failed)} articles unrecoverable after retries: {failed[:20]}")
-    return out
+        sample = ", ".join(item.article_id for item in failed[:10])
+        log(f"warning: {len(failed)} unrecovered article fetches: {sample}")
+    if not articles:
+        raise RuntimeError("no article API records fetched")
+    return articles
 
 
-# ---- Step 3: render ----
-def esc(s):
-    return html.escape(s, quote=False)
+def rank_articles(items: Iterable[Article]) -> list[Article]:
+    return sorted(
+        items,
+        key=lambda item: (
+            -item.views,
+            -item.score,
+            -item.comments,
+            -item.published_msk.timestamp(),
+            int(item.article_id),
+        ),
+    )
 
 
-def fmt_dt(dt_msk):
-    return dt_msk.strftime("%Y-%m-%d %H:%M")
+def rank_by_score(items: Iterable[Article]) -> list[Article]:
+    return sorted(
+        items,
+        key=lambda item: (
+            -item.score,
+            -item.views,
+            -item.comments,
+            -item.published_msk.timestamp(),
+            int(item.article_id),
+        ),
+    )
 
 
-def render_item(rank, art):
-    title = f'<b><a href="{art["url"]}">{esc(art["title"])}</a></b>'
-    parts = [f"{rank} {title}"]
-    if art["desc"]:
-        parts.append(esc(art["desc"]))
-    parts.append("")  # spacer
-    parts.append(f"📅 Дата: <b>{fmt_dt(art['pub_msk'])}</b>")
-    parts.append(f"👁 Просмотры: <b>{art['views']}</b>")
-    parts.append(f"⭐ Рейтинг: <b>{art['score']}</b>")
+def esc(value: str) -> str:
+    return html.escape(value, quote=False)
+
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def render_article(rank: str, article: Article, desc_limit: int) -> str:
+    parts = [f'{rank} <b><a href="{article.url}">{esc(article.title)}</a></b>']
+    description = clip(article.description, desc_limit)
+    if description:
+        parts.append(esc(description))
+    parts.extend([
+        "",
+        f"📅 Дата: <b>{fmt_dt(article.published_msk)}</b>",
+        f"👁 Просмотры: <b>{article.views}</b>",
+        f"⭐ Рейтинг: <b>{article.score}</b>",
+    ])
     return "\n".join(parts)
 
 
-def render_highlight(icon, label, art):
-    """Render a highlight block (Trend / Top) with the given icon and label."""
-    title = f'<b><a href="{art["url"]}">{esc(art["title"])}</a></b>'
-    parts = [f"{icon} <b>{esc(label)}</b>", title]
-    if art["desc"]:
-        parts.append(esc(art["desc"]))
-    parts.append("")
-    parts.append(f"📅 Дата: <b>{fmt_dt(art['pub_msk'])}</b>")
-    parts.append(f"👁 Просмотры: <b>{art['views']}</b>")
-    parts.append(f"⭐ Рейтинг: <b>{art['score']}</b>")
+def render_highlight(icon: str, label: str, article: Article, desc_limit: int) -> str:
+    parts = [
+        f"{icon} <b>{esc(label)}</b>",
+        f'<b><a href="{article.url}">{esc(article.title)}</a></b>',
+    ]
+    description = clip(article.description, desc_limit)
+    if description:
+        parts.append(esc(description))
+    parts.extend([
+        "",
+        f"📅 Дата: <b>{fmt_dt(article.published_msk)}</b>",
+        f"👁 Просмотры: <b>{article.views}</b>",
+        f"⭐ Рейтинг: <b>{article.score}</b>",
+    ])
     return "\n".join(parts)
 
 
-SEP = "➖➖➖➖➖➖➖➖➖➖➖➖"
-
-
-def build_message(top5, trend, top, kind, period_word, trend_label, top_label, desc_limit=None):
-    head = f"<b>📊 Хабр дайджест</b> - <b><i>{esc(kind)}</i></b>"
-    sub = f"Самые популярные статьи за <b>{esc(period_word)}</b> 🔝"
-    blocks = [head, sub, SEP, ""]
-    for i, art in enumerate(top5):
-        a = dict(art)
-        if desc_limit is not None:
-            a["desc"] = clean_text_keep(a["desc"], desc_limit)
-        blocks.append(render_item(RANK[i], a))
-        blocks.append("")  # spacer between articles
-    if trend and trend_label:
-        blocks.append(SEP)
+def build_message(
+    *,
+    period: str,
+    top5: list[Article],
+    trend: Article | None,
+    top: Article | None,
+    desc_limit: int,
+) -> str:
+    cfg = PERIODS[period]
+    blocks = [
+        f"<b>📊 Хабр дайджест</b> - <b><i>{esc(cfg['kind'])}</i></b>",
+        f"Самые популярные статьи за <b>{esc(cfg['period_word'])}</b> 🔝",
+        SEP,
+        "",
+    ]
+    for index, article in enumerate(top5):
+        blocks.append(render_article(RANKS[index], article, desc_limit))
         blocks.append("")
-        a = dict(trend)
-        if desc_limit is not None:
-            a["desc"] = clean_text_keep(a["desc"], desc_limit)
-        blocks.append(render_highlight("🔥", trend_label, a))
-        blocks.append("")
-    if top and top_label:
-        blocks.append(SEP)
-        blocks.append("")
-        a = dict(top)
-        if desc_limit is not None:
-            a["desc"] = clean_text_keep(a["desc"], desc_limit)
-        blocks.append(render_highlight("🏆", top_label, a))
-    # drop trailing empty block(s)
+    if top is not None and cfg["top_label"]:
+        blocks.extend([SEP, "", render_highlight("🏆", str(cfg["top_label"]), top, desc_limit), ""])
+    if trend is not None and cfg["trend_label"]:
+        blocks.extend([SEP, "", render_highlight("🔥", str(cfg["trend_label"]), trend, desc_limit), ""])
     while blocks and blocks[-1] == "":
         blocks.pop()
     return "\n".join(blocks)
 
 
-def clean_text_keep(txt, limit):
-    if not txt:
-        return ""
-    if len(txt) <= limit:
-        return txt
-    return txt[:limit].rstrip() + "…"
+def fit_message(period: str, top5: list[Article], trend: Article | None, top: Article | None) -> str:
+    for desc_limit in (220, 180, 140, 100, 70, 40, 0):
+        message = build_message(period=period, top5=top5, trend=trend, top=top, desc_limit=desc_limit)
+        if len(message) <= TG_LIMIT:
+            return message
+    raise RuntimeError("message does not fit Telegram limit even without descriptions")
 
 
-# ---- Step 4: send ----
-def get_config():
-    """Read token / chat / thread from environment. Fails loudly if missing."""
-    token = os.environ.get(ENV_TOKEN, "").strip()
-    chat = os.environ.get(ENV_CHAT, "").strip()
-    thread = os.environ.get(ENV_THREAD, "").strip()
-    missing = [n for n, v in ((ENV_TOKEN, token), (ENV_CHAT, chat)) if not v]
-    if missing:
-        raise RuntimeError(f"missing required env vars: {', '.join(missing)}")
-    return token, chat, (int(thread) if thread else None)
+def select_digest(period: str, now_msk: datetime) -> tuple[list[Article], Article | None, Article | None]:
+    cfg = PERIODS[period]
+    summary_days = int(cfg["summary_days"])
+    highlight_days = cfg["highlight_days"]
+    fetch_days = max(summary_days, int(highlight_days or 0))
+    fetch_start_utc = (now_msk - timedelta(days=fetch_days)).astimezone(timezone.utc)
+    summary_start = now_msk - timedelta(days=summary_days)
+
+    log(f"period={period} now_msk={now_msk.isoformat()} fetch_days={fetch_days}")
+    candidates = fetch_candidates(fetch_start_utc)
+    log(f"candidates from sitemap: {len(candidates)}")
+    if not candidates:
+        raise RuntimeError("sitemap produced no candidates")
+
+    articles = fetch_articles(candidates)
+    log(f"articles fetched: {len(articles)}")
+
+    summary_pool = [item for item in articles if summary_start <= item.published_msk <= now_msk]
+    top5 = rank_articles(summary_pool)[:5]
+    if not top5:
+        raise RuntimeError(f"no articles in {period} summary window")
+
+    top = None
+    trend = None
+    if highlight_days:
+        highlight_start = now_msk - timedelta(days=int(highlight_days))
+        window = [item for item in articles if highlight_start <= item.published_msk <= now_msk]
+        excluded = {item.article_id for item in top5}
+        top_pool = [item for item in window if item.article_id not in excluded]
+        top_ranked = rank_by_score(top_pool)
+        if top_ranked:
+            top = top_ranked[0]
+            excluded.add(top.article_id)
+        trend_pool = [item for item in window if item.article_id not in excluded]
+        trend_ranked = rank_articles(trend_pool)
+        if trend_ranked:
+            trend = trend_ranked[0]
+
+    return top5, trend, top
 
 
-def send_telegram(text):
-    token, chat, thread = get_config()
-    payload = {
-        "chat_id": chat,
-        "text": text,
+def send_telegram(message: str, chat_id: str, thread_id: str | None) -> dict:
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    if not token:
+        raise RuntimeError(f"missing required environment variable: {TOKEN_ENV}")
+    payload: dict[str, object] = {
+        "chat_id": chat_id,
+        "text": message,
         "parse_mode": "HTML",
         "link_preview_options": {"is_disabled": True},
     }
-    if thread is not None:
-        payload["message_thread_id"] = thread
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    raw = request_bytes(
         TELEGRAM_API.format(token=token),
         data=data,
-        headers={"Content-Type": "application/json", "User-Agent": UA},
+        headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-        resp = json.loads(r.read())
-    if not resp.get("ok"):
-        raise RuntimeError(f"Telegram API error: {resp}")
-    return resp
+    response = json.loads(raw.decode("utf-8"))
+    if not response.get("ok"):
+        raise RuntimeError(f"Telegram API returned an error: {response}")
+    return response
 
 
-def fit_message(top5, trend, top, kind, period_word, trend_label, top_label):
-    """Guarantee the message fits one Telegram message (<TG_LIMIT) by shrinking
-    descriptions in cascading steps."""
-    msg = None
-    for limit in (220, 180, 140, 100, 70, 40, 0):
-        lim = None if limit == 220 else limit
-        msg = build_message(top5, trend, top, kind, period_word,
-                            trend_label, top_label, desc_limit=lim)
-        if len(msg) <= TG_LIMIT:
-            return msg
-    return msg[:TG_LIMIT]  # hard cut as last resort
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--period", required=True, choices=sorted(PERIODS))
+    parser.add_argument("--dry-run", action="store_true", help="print message, do not send")
+    parser.add_argument("--debug", action="store_true", help="print selected article diagnostics to stderr")
+    parser.add_argument("--chat-id", default="", help="Telegram chat id for sending")
+    parser.add_argument("--thread-id", default="", help="Telegram forum topic id for sending")
+    return parser.parse_args()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--period", required=True, choices=list(PERIODS))
-    ap.add_argument("--dry-run", action="store_true", help="print to stdout, do not send")
-    ap.add_argument("--debug", action="store_true")
-    args = ap.parse_args()
-
-    summary_days, trend_days, kind, period_word, trend_label, top_label = PERIODS[args.period]
-    now = datetime.now(MSK)
-    summary_start = now - timedelta(days=summary_days)
-    fetch_days = max(summary_days, trend_days or 0)
-    fetch_start = (now - timedelta(days=fetch_days)).astimezone(timezone.utc)
-
-    log(f"period={args.period} now_msk={now.isoformat()} fetch_days={fetch_days}")
-    ids = fetch_candidate_ids(fetch_start)
-    log(f"candidates from sitemap: {len(ids)}")
-    if not ids:
-        raise RuntimeError("sitemap returned no candidates")
-
-    arts = fetch_all(ids)
-    log(f"articles fetched (postType=article): {len(arts)}")
-
-    # Summary: published within [summary_start, now]
-    summary_pool = [a for a in arts if summary_start <= a["pub_msk"] <= now]
-    summary_pool.sort(key=lambda a: a["views"], reverse=True)
-    top5 = summary_pool[:5]
-    if not top5:
-        raise RuntimeError(f"no articles for period {args.period}")
-
-    # Variant A: pick Top (by score) FIRST, then Trend (by views) excluding Top.
-    # This guarantees 🏆 Top shows the absolute maximum score, even if that same
-    # article also leads by views (in which case Trend takes the 2nd by views).
-    trend = None
-    top = None
-    if trend_days:
-        trend_start = now - timedelta(days=trend_days)
-        window = [a for a in arts if trend_start <= a["pub_msk"] <= now]
-        top_ids = {a["id"] for a in top5}
-        # Top: most-rated article in the trend window, excluding the top-5
-        top_pool = [a for a in window if a["id"] not in top_ids]
-        top_pool.sort(key=lambda a: a["score"], reverse=True)
-        if top_pool:
-            top = top_pool[0]
-        # Trend: most-viewed article, excluding top-5 and Top
-        exclude = set(top_ids)
-        if top:
-            exclude.add(top["id"])
-        trend_pool = [a for a in window if a["id"] not in exclude]
-        trend_pool.sort(key=lambda a: a["views"], reverse=True)
-        if trend_pool:
-            trend = trend_pool[0]
-
+def main() -> int:
+    args = parse_args()
+    top5, trend, top = select_digest(args.period, datetime.now(MSK))
     if args.debug:
-        for i, a in enumerate(top5):
-            log(f"  {i+1}. views={a['views']:>6} score={a['score']:>5} | {a['pub_msk']:%Y-%m-%d %H:%M} | {a['title'][:55]}")
-        if trend:
-            log(f"  TREND views={trend['views']} score={trend['score']} | {trend['title'][:55]}")
+        for index, article in enumerate(top5, 1):
+            log(f"top{index}: views={article.views} score={article.score} comments={article.comments} id={article.article_id} title={article.title[:70]}")
         if top:
-            log(f"  TOP   score={top['score']} views={top['views']} | {top['title'][:55]}")
-
-    msg = fit_message(top5, trend, top, kind, period_word, trend_label, top_label)
-    log(f"message length: {len(msg)}")
+            log(f"top-highlight: score={top.score} views={top.views} id={top.article_id} title={top.title[:70]}")
+        if trend:
+            log(f"trend-highlight: views={trend.views} score={trend.score} id={trend.article_id} title={trend.title[:70]}")
+    message = fit_message(args.period, top5, trend, top)
+    log(f"message length: {len(message)}")
 
     if args.dry_run:
-        print(msg)
-        return
-
-    send_telegram(msg)
-    log("sent OK")
-    print("")  # quiet success for no_agent cron
+        print(message)
+        return 0
+    if not args.chat_id:
+        raise RuntimeError("--chat-id is required unless --dry-run is used")
+    send_telegram(message, args.chat_id, args.thread_id or None)
+    print("")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
-    except Exception as e:
-        log(f"FATAL: {e}")
-        sys.exit(1)
+        raise SystemExit(main())
+    except Exception as exc:  # noqa: BLE001
+        log(f"fatal: {exc}")
+        raise SystemExit(1)
