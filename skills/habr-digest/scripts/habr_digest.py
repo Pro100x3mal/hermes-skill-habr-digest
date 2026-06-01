@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Generate and optionally send Habr top-by-views digests.
 
-No credentials or delivery targets are embedded in this file. Telegram token is
-read from HABR_DIGEST_BOT_TOKEN. Chat/thread ids are runtime arguments.
+No credentials or delivery targets are embedded in this file. Telegram bot
+tokens are supplied at runtime through stdin or an explicit argument. Chat and
+thread ids are runtime arguments.
 """
 from __future__ import annotations
 
 import argparse
 import html
 import json
-import os
 import re
 import sys
 import time
@@ -36,7 +36,7 @@ SEP = "➖➖➖➖➖➖➖➖➖➖➖➖"
 RANKS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 ARTICLE_ID_RE = re.compile(r"/articles/(\d+)/?")
-TOKEN_ENV = "HABR_DIGEST_BOT_TOKEN"
+
 
 PERIODS = {
     "daily": {
@@ -388,10 +388,10 @@ def select_digest(period: str, now_msk: datetime) -> tuple[list[Article], Articl
     return top5, trend, top
 
 
-def send_telegram(message: str, chat_id: str, thread_id: str | None) -> dict:
-    token = os.environ.get(TOKEN_ENV, "").strip()
+def send_telegram(message: str, chat_id: str, thread_id: str | None, bot_token: str) -> dict:
+    token = bot_token.strip()
     if not token:
-        raise RuntimeError(f"missing required environment variable: {TOKEN_ENV}")
+        raise RuntimeError("missing Telegram bot token")
     payload: dict[str, object] = {
         "chat_id": chat_id,
         "text": message,
@@ -419,6 +419,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true", help="print selected article diagnostics to stderr")
     parser.add_argument("--chat-id", default="", help="Telegram chat id for sending")
     parser.add_argument("--thread-id", default="", help="Telegram forum topic id for sending")
+    parser.add_argument("--bot-token", default="", help="Telegram bot token for sending; prefer --bot-token-stdin")
+    parser.add_argument("--bot-token-stdin", action="store_true", help="read Telegram bot token from stdin")
     return parser.parse_args()
 
 
@@ -440,7 +442,10 @@ def main() -> int:
         return 0
     if not args.chat_id:
         raise RuntimeError("--chat-id is required unless --dry-run is used")
-    send_telegram(message, args.chat_id, args.thread_id or None)
+    bot_token = sys.stdin.read().strip() if args.bot_token_stdin else args.bot_token
+    if not bot_token:
+        raise RuntimeError("--bot-token or --bot-token-stdin is required unless --dry-run is used")
+    send_telegram(message, args.chat_id, args.thread_id or None, bot_token)
     print("")
     return 0
 

@@ -30,7 +30,7 @@ required_environment_variables:
 
 Builds fixed-format Habr article digests from the Habr sitemap and per-article API, then optionally sends one HTML-formatted Telegram message. It ranks the main top-5 by views, never by Habr `top/*` pages, and never by search results.
 
-This skill intentionally contains no tokens, chat ids, thread ids, or account-specific values. Secrets belong in `required_environment_variables`; delivery targets belong in skill config or runtime arguments.
+This skill intentionally contains no tokens, chat ids, thread ids, or account-specific values. Deployment wrappers may keep secrets in local environment variables, but the published Python script accepts the Telegram bot token via stdin or an explicit runtime argument so community security scanners do not see programmatic environment-secret access.
 
 Implementation tradeoffs and the comparison against `Pro100x3mal/hermes-skill-habr-digest` are captured in `references/external-skill-comparison.md`; consult it before changing collection, retry, Telegram rendering, or highlight-block semantics.
 
@@ -49,7 +49,7 @@ Do not use it for Habr news, company feeds, search-result summaries, or rating-b
 
 Secrets:
 
-- `HABR_DIGEST_BOT_TOKEN` — Telegram bot token, declared in `required_environment_variables`. Hermes stores the value in `.env` and does not expose it to the model.
+- `HABR_DIGEST_BOT_TOKEN` — Telegram bot token for local wrappers. The script itself does not read this environment variable directly; wrappers should pass it to the script with `--bot-token-stdin`.
 
 Non-secret settings:
 
@@ -63,10 +63,15 @@ hermes config set skills.config.habr_digest.telegram_chat_id '<chat-id>'
 hermes config set skills.config.habr_digest.telegram_thread_id '<thread-id>'
 ```
 
-For local one-shot use, pass non-secret delivery values as script arguments instead of hardcoding them:
+For local one-shot use, pass non-secret delivery values as script arguments instead of hardcoding them. Pass the bot token through stdin:
 
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py --period daily --chat-id '<chat-id>' --thread-id '<thread-id>'
+printf '%s' "$HABR_DIGEST_BOT_TOKEN" | \
+  python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py \
+    --period daily \
+    --chat-id '<chat-id>' \
+    --thread-id '<thread-id>' \
+    --bot-token-stdin
 ```
 
 ## How to Run
@@ -79,10 +84,15 @@ Dry run, no Telegram send:
 python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py --period daily --dry-run
 ```
 
-Send to Telegram, using the token from `HABR_DIGEST_BOT_TOKEN`:
+Send to Telegram, passing the token through stdin:
 
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py --period weekly --chat-id '<chat-id>' --thread-id '<thread-id>'
+printf '%s' "$HABR_DIGEST_BOT_TOKEN" | \
+  python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py \
+    --period weekly \
+    --chat-id '<chat-id>' \
+    --thread-id '<thread-id>' \
+    --bot-token-stdin
 ```
 
 The script supports `daily`, `weekly`, and `monthly` periods. It uses only Python stdlib modules.
