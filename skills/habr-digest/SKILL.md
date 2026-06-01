@@ -1,7 +1,7 @@
 ---
 name: habr-digest
-description: Build Habr top-by-views Telegram digests.
-version: 1.0.0
+description: Build Habr top-by-views digest messages.
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -10,36 +10,22 @@ metadata:
     tags: [habr, research, telegram, digest, cron]
     related_skills: [hermes-agent]
     requires_toolsets: [terminal]
-    config:
-      - key: habr_digest.telegram_chat_id
-        description: Telegram chat id for digest delivery.
-        default: ""
-        prompt: Telegram chat id
-      - key: habr_digest.telegram_thread_id
-        description: Optional Telegram forum topic thread id.
-        default: ""
-        prompt: Telegram topic thread id, if any
-required_environment_variables:
-  - name: HABR_DIGEST_BOT_TOKEN
-    prompt: Telegram bot token
-    help: Create or reuse a bot token via BotFather.
-    required_for: Sending digests to Telegram
 ---
 
 # Habr Digest Skill
 
-Builds fixed-format Habr article digests from the Habr sitemap and per-article API, then optionally sends one HTML-formatted Telegram message. It ranks the main top-5 by views, never by Habr `top/*` pages, and never by search results.
+Builds fixed-format Habr article digests from the Habr sitemap and per-article API, then prints one standard-Markdown message to stdout. Delivery is intentionally handled by Hermes cron/gateway, not by this skill.
 
-This skill intentionally contains no tokens, chat ids, thread ids, or account-specific values. Deployment wrappers may keep secrets in local environment variables, but the published Python script accepts the Telegram bot token via stdin or an explicit runtime argument so community security scanners do not see programmatic environment-secret access.
+This skill ranks the main top-5 by views, never by Habr `top/*` pages, and never by search results. It contains no Telegram tokens, chat ids, thread ids, or account-specific values.
 
-Implementation tradeoffs and the comparison against `Pro100x3mal/hermes-skill-habr-digest` are captured in `references/external-skill-comparison.md`; consult it before changing collection, retry, Telegram rendering, or highlight-block semantics.
+Implementation tradeoffs and the comparison against the earlier external implementation are captured in `references/external-skill-comparison.md`; consult it before changing collection, retry, rendering, or highlight-block semantics.
 
 ## When to Use
 
 Use this skill when the task is to:
 
-- generate daily, weekly, or monthly Habr article digests;
-- schedule Habr digests with `cronjob` and a wrapper script;
+- generate daily, weekly, or monthly Habr article digest messages;
+- schedule Habr digests with Hermes cron;
 - debug Habr collection, ranking, or Telegram formatting;
 - verify that a digest is generated from Habr's sitemap plus article API only.
 
@@ -47,61 +33,40 @@ Do not use it for Habr news, company feeds, search-result summaries, or rating-b
 
 ## Prerequisites
 
-Secrets:
+Runtime requirements:
 
-- `HABR_DIGEST_BOT_TOKEN` — Telegram bot token for local wrappers. The script itself does not read this environment variable directly; wrappers should pass it to the script with `--bot-token-stdin`.
+- Python 3.10+.
+- Network access to `https://habr.com`.
+- For scheduled Telegram delivery: a configured Hermes Telegram gateway/home or explicit cron delivery target.
 
-Non-secret settings:
-
-- `skills.config.habr_digest.telegram_chat_id` — Telegram chat id.
-- `skills.config.habr_digest.telegram_thread_id` — optional Telegram forum topic id.
-
-Manual config examples:
-
-```bash
-hermes config set skills.config.habr_digest.telegram_chat_id '<chat-id>'
-hermes config set skills.config.habr_digest.telegram_thread_id '<thread-id>'
-```
-
-For local one-shot use, pass non-secret delivery values as script arguments instead of hardcoding them. Pass the bot token through stdin:
-
-```bash
-printf '%s' "$HABR_DIGEST_BOT_TOKEN" | \
-  python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py \
-    --period daily \
-    --chat-id '<chat-id>' \
-    --thread-id '<thread-id>' \
-    --bot-token-stdin
-```
+The skill itself requires no secrets and declares no `required_environment_variables`. Telegram credentials belong to Hermes gateway configuration, not to this skill.
 
 ## How to Run
 
 Use the `terminal` tool to invoke the bundled script.
 
-Dry run, no Telegram send:
+Generate a daily message:
 
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py --period daily --dry-run
+python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py --period daily --debug
 ```
 
-Send to Telegram, passing the token through stdin:
+Supported periods:
 
-```bash
-printf '%s' "$HABR_DIGEST_BOT_TOKEN" | \
-  python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py \
-    --period weekly \
-    --chat-id '<chat-id>' \
-    --thread-id '<thread-id>' \
-    --bot-token-stdin
+```text
+daily
+weekly
+monthly
 ```
 
-The script supports `daily`, `weekly`, and `monthly` periods. It uses only Python stdlib modules.
+The script always writes the user-facing digest to stdout. Diagnostics go to stderr. The legacy `--dry-run` flag is accepted as a no-op for compatibility.
 
 ## Quick Reference
 
 - Script: `${HERMES_SKILL_DIR}/scripts/habr_digest.py`
 - Habr sitemap: `https://habr.com/sitemap_articles1.xml`
 - Article API: `https://habr.com/kek/v2/articles/<id>/?fl=ru&hl=ru`
+- Output: one standard-Markdown message on stdout
 - Main ranking: top-5 by `statistics.readingCount`
 - Daily summary window: 1 day
 - Weekly summary window: 7 days
@@ -109,8 +74,7 @@ The script supports `daily`, `weekly`, and `monthly` periods. It uses only Pytho
 - Daily highlight window: 7 days
 - Weekly highlight window: 30 days
 - Monthly highlights: none
-- Telegram parse mode: HTML
-- Telegram link previews: disabled with `link_preview_options.is_disabled=true`
+- Target message length: ≤ 3900 characters before Hermes delivery
 
 ## Procedure
 
@@ -125,24 +89,24 @@ The script supports `daily`, `weekly`, and `monthly` periods. It uses only Pytho
 9. For daily and weekly, add two non-duplicate highlight blocks:
    - `🏆 Топ недели/месяца` — highest score in the highlight window, excluding the main top-5.
    - `🔥 Тренд недели/месяца` — highest views in the highlight window, excluding the main top-5 and selected top article.
-10. Fit the message under Telegram's 4096-character limit by shortening descriptions only.
-11. Send one HTML message through Telegram Bot API, or print it with `--dry-run`.
+10. Fit the message under the target length by shortening descriptions only.
+11. Print the message to stdout; let Hermes cron/gateway deliver it.
 
 ## Output Format
 
-The script renders exactly one Telegram message:
+The script renders exactly one standard-Markdown message:
 
-```html
-<b>📊 Хабр дайджест</b> - <b><i>📅 Daily</i></b>
-Самые популярные статьи за <b>сутки</b> 🔝
+```markdown
+**📊 Хабр дайджест** - *📅 Daily*
+Самые популярные статьи за **сутки** 🔝
 ➖➖➖➖➖➖➖➖➖➖➖➖
 
-1️⃣ <b><a href="URL">Title</a></b>
+1️⃣ [Title](https://habr.com/ru/articles/123456/)
 Description
 
-📅 Дата: <b>YYYY-MM-DD HH:MM</b>
-👁 Просмотры: <b>N</b>
-⭐ Рейтинг: <b>N</b>
+📅 Дата: **YYYY-MM-DD HH:MM**
+👁 Просмотры: **N**
+⭐ Рейтинг: **N**
 ```
 
 Rules:
@@ -156,20 +120,37 @@ Rules:
 
 ## Cron Setup
 
-For scheduled delivery, create `no_agent` cron jobs with wrapper scripts under `~/.hermes/scripts/`. Cron script paths must be relative to that directory.
+Preferred scheduled delivery is Hermes-native:
 
-Wrapper pattern:
+1. The skill script generates stdout.
+2. Hermes cron runs a no-agent job.
+3. Hermes gateway delivers stdout to Telegram.
+
+Current Hermes cron behavior matters: `cron --script` executes only files under `$HERMES_HOME/scripts/`. Scripts inside an installed skill directory are linked skill assets for agents, but they are not directly executable by `cron --script --no-agent`. Absolute paths and symlinks outside `$HERMES_HOME/scripts/` are rejected by the cron runner.
+
+Therefore scheduled no-agent runs need a tiny launcher under `$HERMES_HOME/scripts/`. The launcher contains no secrets and no Telegram target; it only calls the installed skill script.
+
+Launcher pattern:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-exec python3 "$HOME/.hermes/skills/research/habr-digest/scripts/habr_digest.py" \
-  --period daily \
-  --chat-id "$HABR_DIGEST_CHAT_ID" \
-  ${HABR_DIGEST_THREAD_ID:+--thread-id "$HABR_DIGEST_THREAD_ID"}
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+exec python3 "$HERMES_HOME/skills/habr-digest/scripts/habr_digest.py" --period daily
 ```
 
-Keep the wrapper account-specific and out of the published skill. Do not commit real chat ids, thread ids, or bot tokens.
+Cron delivery example:
+
+```bash
+hermes cron create "0 7 * * *" \
+  --name "Habr daily digest" \
+  --script "habr_digest_daily.sh" \
+  --no-agent \
+  --deliver "telegram:<chat-id>:<thread-id>"
+```
+
+For chats without topics, omit the final `:<thread-id>`.
 
 Recommended schedules:
 
@@ -184,23 +165,26 @@ Recommended schedules:
 3. Sitemap `lastmod` is not publication time. Always filter final windows by API `timePublished`.
 4. Some article API calls return 403 or 404 for deleted, draft, or unavailable content. Treat those as skips, not transient failures.
 5. Transient failures must be retried in a second pass, otherwise a leading article can disappear from the digest.
-6. Do not hardcode credentials or targets in SKILL.md, scripts, wrappers intended for publication, tests, or references.
-7. Telegram HTML must be escaped. Never insert raw title or description HTML into the message.
-8. Do not hard-truncate the final HTML message; it can break tags. Shorten descriptions and fail loudly if the message still cannot fit.
+6. Do not hardcode credentials or targets in SKILL.md, scripts, tests, references, or public examples.
+7. The output is standard Markdown because Hermes Telegram gateway converts it to Telegram MarkdownV2. Do not replace it with raw Telegram MarkdownV2 unless actual gateway delivery is tested.
+8. Do not hard-truncate the final message; it can break links or formatting. Shorten descriptions and fail loudly if the message still cannot fit.
+9. Direct Telegram Bot API sending does not belong in this community skill. Use Hermes gateway delivery instead.
 
 ## Verification
 
-Generate a daily dry run:
+Generate a daily message:
 
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py --period daily --dry-run --debug
+python3 ${HERMES_SKILL_DIR}/scripts/habr_digest.py --period daily --debug
 ```
 
 Expected result:
 
 - exit code `0`;
-- one HTML message printed to stdout;
+- one Markdown message printed to stdout;
 - stderr contains candidate/fetch/debug counters;
-- message length is below 4096 characters;
-- article titles are escaped HTML links;
+- message length is below 3900 characters;
+- article titles are Markdown links;
 - no token, chat id, or thread id appears in the skill files.
+
+For Telegram delivery verification, send through Hermes gateway/cron and inspect the rendered target message. Do not assume source Markdown equals Telegram rendering.

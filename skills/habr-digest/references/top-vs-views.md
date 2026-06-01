@@ -24,4 +24,4 @@ The digest ranks articles by `statistics.readingCount` from the per-article API.
 
 ## Security note
 
-Do not store real Telegram bot tokens, chat ids, thread ids, account names, or other deployment data in this reference file. Runtime values belong in `.env`, Hermes skill config, wrapper-local environment variables, or command-line arguments.
+Do not store real Telegram bot tokens, chat ids, thread ids, account names, or other deployment data in this reference file. Telegram credentials belong to Hermes gateway configuration; delivery targets belong to cron configuration or local launch procedure, not to the published skill.

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate and optionally send Habr top-by-views digests.
+"""Generate Habr top-by-views digests as stdout.
 
-No credentials or delivery targets are embedded in this file. Telegram bot
-tokens are supplied at runtime through stdin or an explicit argument. Chat and
-thread ids are runtime arguments.
+This script is intentionally generator-only: it fetches Habr data, ranks articles,
+and prints one standard-Markdown message. Delivery is handled by Hermes cron /
+gateway, not by this skill. That keeps Telegram credentials and targets in Hermes
+configuration instead of the published community skill.
 """
 from __future__ import annotations
 
@@ -25,13 +26,12 @@ MSK = timezone(timedelta(hours=3))
 SITEMAP_URL = "https://habr.com/sitemap_articles1.xml"
 ARTICLE_API = "https://habr.com/kek/v2/articles/{article_id}/?fl=ru&hl=ru"
 ARTICLE_URL = "https://habr.com/ru/articles/{article_id}/"
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 USER_AGENT = "Mozilla/5.0 (compatible; HermesHabrDigest/1.0)"
 HTTP_TIMEOUT = 20
 MAX_RETRIES = 4
 WORKERS = 64
 RETRY_WORKERS = 16
-TG_LIMIT = 4096
+MESSAGE_LIMIT = 3900
 SEP = "➖➖➖➖➖➖➖➖➖➖➖➖"
 RANKS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -105,11 +105,8 @@ def to_msk(value: str) -> datetime:
     return parse_iso(value).astimezone(MSK)
 
 
-def request_bytes(url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None) -> bytes:
-    merged_headers = {"User-Agent": USER_AGENT}
-    if headers:
-        merged_headers.update(headers)
-    req = urllib.request.Request(url, data=data, headers=merged_headers)
+def request_bytes(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     last_error: BaseException | None = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -119,7 +116,7 @@ def request_bytes(url: str, *, data: bytes | None = None, headers: dict[str, str
             if exc.code in (403, 404):
                 raise
             last_error = exc
-        except Exception as exc:  # noqa: BLE001 - stdlib script, retry transient network errors
+        except Exception as exc:  # noqa: BLE001 - retry transient network errors
             last_error = exc
         if attempt < MAX_RETRIES - 1:
             time.sleep((2**attempt) * 0.5)
@@ -153,6 +150,14 @@ def clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip(" ,.;:-") + "…"
+
+
+def md_link_text(value: str) -> str:
+    """Make text safe for a simple [text](url) Markdown link display part."""
+    value = re.sub(r"\s+", " ", value).strip()
+    # Hermes Telegram adapter handles escaping, but its link regex needs balanced
+    # brackets in the display text. Preserve meaning without raw bracket syntax.
+    return value.replace("[", "(").replace("]", ")")
 
 
 def fetch_candidates(fetch_start_utc: datetime) -> list[Candidate]:
@@ -273,41 +278,37 @@ def rank_by_score(items: Iterable[Article]) -> list[Article]:
     )
 
 
-def esc(value: str) -> str:
-    return html.escape(value, quote=False)
-
-
 def fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def render_article(rank: str, article: Article, desc_limit: int) -> str:
-    parts = [f'{rank} <b><a href="{article.url}">{esc(article.title)}</a></b>']
+    parts = [f"{rank} [{md_link_text(article.title)}]({article.url})"]
     description = clip(article.description, desc_limit)
     if description:
-        parts.append(esc(description))
+        parts.append(description)
     parts.extend([
         "",
-        f"📅 Дата: <b>{fmt_dt(article.published_msk)}</b>",
-        f"👁 Просмотры: <b>{article.views}</b>",
-        f"⭐ Рейтинг: <b>{article.score}</b>",
+        f"📅 Дата: **{fmt_dt(article.published_msk)}**",
+        f"👁 Просмотры: **{article.views}**",
+        f"⭐ Рейтинг: **{article.score}**",
     ])
     return "\n".join(parts)
 
 
 def render_highlight(icon: str, label: str, article: Article, desc_limit: int) -> str:
     parts = [
-        f"{icon} <b>{esc(label)}</b>",
-        f'<b><a href="{article.url}">{esc(article.title)}</a></b>',
+        f"{icon} **{label}**",
+        f"[{md_link_text(article.title)}]({article.url})",
     ]
     description = clip(article.description, desc_limit)
     if description:
-        parts.append(esc(description))
+        parts.append(description)
     parts.extend([
         "",
-        f"📅 Дата: <b>{fmt_dt(article.published_msk)}</b>",
-        f"👁 Просмотры: <b>{article.views}</b>",
-        f"⭐ Рейтинг: <b>{article.score}</b>",
+        f"📅 Дата: **{fmt_dt(article.published_msk)}**",
+        f"👁 Просмотры: **{article.views}**",
+        f"⭐ Рейтинг: **{article.score}**",
     ])
     return "\n".join(parts)
 
@@ -322,8 +323,8 @@ def build_message(
 ) -> str:
     cfg = PERIODS[period]
     blocks = [
-        f"<b>📊 Хабр дайджест</b> - <b><i>{esc(cfg['kind'])}</i></b>",
-        f"Самые популярные статьи за <b>{esc(cfg['period_word'])}</b> 🔝",
+        f"**📊 Хабр дайджест** - *{cfg['kind']}*",
+        f"Самые популярные статьи за **{cfg['period_word']}** 🔝",
         SEP,
         "",
     ]
@@ -342,9 +343,9 @@ def build_message(
 def fit_message(period: str, top5: list[Article], trend: Article | None, top: Article | None) -> str:
     for desc_limit in (220, 180, 140, 100, 70, 40, 0):
         message = build_message(period=period, top5=top5, trend=trend, top=top, desc_limit=desc_limit)
-        if len(message) <= TG_LIMIT:
+        if len(message) <= MESSAGE_LIMIT:
             return message
-    raise RuntimeError("message does not fit Telegram limit even without descriptions")
+    raise RuntimeError("message does not fit Telegram delivery limit even without descriptions")
 
 
 def select_digest(period: str, now_msk: datetime) -> tuple[list[Article], Article | None, Article | None]:
@@ -388,39 +389,11 @@ def select_digest(period: str, now_msk: datetime) -> tuple[list[Article], Articl
     return top5, trend, top
 
 
-def send_telegram(message: str, chat_id: str, thread_id: str | None, bot_token: str) -> dict:
-    token = bot_token.strip()
-    if not token:
-        raise RuntimeError("missing Telegram bot token")
-    payload: dict[str, object] = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "link_preview_options": {"is_disabled": True},
-    }
-    if thread_id:
-        payload["message_thread_id"] = int(thread_id)
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    raw = request_bytes(
-        TELEGRAM_API.format(token=token),
-        data=data,
-        headers={"Content-Type": "application/json"},
-    )
-    response = json.loads(raw.decode("utf-8"))
-    if not response.get("ok"):
-        raise RuntimeError(f"Telegram API returned an error: {response}")
-    return response
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Generate one Habr digest message as stdout.")
     parser.add_argument("--period", required=True, choices=sorted(PERIODS))
-    parser.add_argument("--dry-run", action="store_true", help="print message, do not send")
+    parser.add_argument("--dry-run", action="store_true", help="compatibility no-op; output is always stdout")
     parser.add_argument("--debug", action="store_true", help="print selected article diagnostics to stderr")
-    parser.add_argument("--chat-id", default="", help="Telegram chat id for sending")
-    parser.add_argument("--thread-id", default="", help="Telegram forum topic id for sending")
-    parser.add_argument("--bot-token", default="", help="Telegram bot token for sending; prefer --bot-token-stdin")
-    parser.add_argument("--bot-token-stdin", action="store_true", help="read Telegram bot token from stdin")
     return parser.parse_args()
 
 
@@ -436,17 +409,7 @@ def main() -> int:
             log(f"trend-highlight: views={trend.views} score={trend.score} id={trend.article_id} title={trend.title[:70]}")
     message = fit_message(args.period, top5, trend, top)
     log(f"message length: {len(message)}")
-
-    if args.dry_run:
-        print(message)
-        return 0
-    if not args.chat_id:
-        raise RuntimeError("--chat-id is required unless --dry-run is used")
-    bot_token = sys.stdin.read().strip() if args.bot_token_stdin else args.bot_token
-    if not bot_token:
-        raise RuntimeError("--bot-token or --bot-token-stdin is required unless --dry-run is used")
-    send_telegram(message, args.chat_id, args.thread_id or None, bot_token)
-    print("")
+    print(message)
     return 0
 
 
