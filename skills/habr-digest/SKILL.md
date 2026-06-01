@@ -1,7 +1,7 @@
 ---
 name: habr-digest
 description: Build Habr top-by-views digest messages.
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -68,11 +68,11 @@ The script always writes the user-facing digest to stdout. Diagnostics go to std
 - Article API: `https://habr.com/kek/v2/articles/<id>/?fl=ru&hl=ru`
 - Output: one standard-Markdown message on stdout
 - Main ranking: top-5 by `statistics.readingCount`
-- Daily summary window: 1 day
-- Weekly summary window: 7 days
-- Monthly summary window: 30 days
-- Daily highlight window: 7 days
-- Weekly highlight window: 30 days
+- Daily summary window: rolling 1 day from run time
+- Weekly summary window: rolling 7 days from run time
+- Monthly summary window: rolling 30 days from run time
+- Daily highlight window: rolling 7 days from run time
+- Weekly highlight window: rolling 30 days from run time
 - Monthly highlights: none
 - Target message length: ≤ 3900 characters before Hermes delivery
 
@@ -126,9 +126,79 @@ Preferred scheduled delivery is Hermes-native:
 2. Hermes cron runs a no-agent job.
 3. Hermes gateway delivers stdout to Telegram.
 
-Current Hermes cron behavior matters: `cron --script` executes only files under `$HERMES_HOME/scripts/`. Scripts inside an installed skill directory are linked skill assets for agents, but they are not directly executable by `cron --script --no-agent`. Absolute paths and symlinks outside `$HERMES_HOME/scripts/` are rejected by the cron runner.
+Current Hermes cron behavior matters in two separate ways:
 
-Therefore scheduled no-agent runs need a tiny launcher under `$HERMES_HOME/scripts/`. The launcher contains no secrets and no Telegram target; it only calls the installed skill script.
+1. `cron --script` executes only files under `$HERMES_HOME/scripts/`. Scripts inside an installed skill directory are linked skill assets for agents, but they are not directly executable by `cron --script --no-agent`. Absolute paths and symlinks outside `$HERMES_HOME/scripts/` are rejected by the cron runner.
+2. `cron --script` does not provide a per-job argv mechanism. This skill's bundled script requires `--period daily|weekly|monthly`.
+
+Therefore scheduled no-agent runs need a tiny launcher under `$HERMES_HOME/scripts/`. The launcher is not part of the skill's own internal structure and exists only to adapt Hermes cron's current script-runner constraints. It contains no secrets and no Telegram target; it only calls the installed skill script with the needed `--period` value.
+
+Separate from script launching, Hermes cron delivery itself can wrap the final stdout with a header/footer. That wrapper is applied after this skill prints its message, so the skill cannot remove it from inside `habr_digest.py`. If clean delivery is required, disable the global Hermes setting `cron.wrap_response`.
+
+### Natural-language lifecycle workflow for agents
+
+When a user asks in natural language to schedule, change, pause, resume, or stop this skill — for example, "Запусти habr digest daily в 07:00 с отправкой в telegram chatID ... threadID ..." — the agent should treat it as an orchestration task and complete it end-to-end.
+
+Supported intents:
+
+- `create`: start a new daily/weekly/monthly digest;
+- `update`: change an existing digest's schedule, target, or period;
+- `pause`: temporarily stop an existing digest without deleting it;
+- `resume`: re-enable a paused digest;
+- `remove`: permanently stop and delete an existing digest.
+
+Intent triggers from natural language:
+
+- `create`: "запусти", "создай", "настрой", "добавь", "schedule", "start";
+- `update`: "измени", "обнови", "перенеси", "смени время", "change schedule", "retarget";
+- `pause`: "поставь на паузу", "pause", "temporarily stop";
+- `resume`: "возобнови", "resume", "enable again";
+- `remove`: "останови", "удали", "убери", "stop digest", "delete cron".
+
+Required fields to resolve:
+
+- `period`: one of `daily`, `weekly`, `monthly`;
+- `schedule`: a concrete Hermes cron schedule string for `create` and schedule-changing `update`;
+- `deliver`: Telegram target in the form `telegram:<chat-id>` or `telegram:<chat-id>:<thread-id>` when the target matters.
+
+Resolution rules:
+
+1. Parse intent first, then parse `period`, `schedule`, and Telegram target from the user's prompt.
+2. If one required field is missing, ask one precise follow-up question only for that field.
+3. Prefer explicit Telegram IDs from the user. If the user only says "send to this chat" or equivalent, the agent may use the current origin target.
+4. If the user asks to change only one property, preserve the existing values for the other properties.
+5. If the request clearly refers to an already running digest for the same `period` and Telegram target, treat it as `update`, not `create`.
+6. If multiple existing jobs match the user's request and the intended one is not obvious, ask one precise disambiguation question.
+
+Deterministic naming:
+
+- Launcher path pattern:
+  - `habr_digest_<period>__chat_<chat-id>__thread_<thread-id-or-root>.sh`
+- Recommended job name pattern:
+  - `Habr <period> digest -> telegram:<chat-id>:<thread-id-or-root>`
+
+Create/update workflow:
+
+1. Inspect existing cron jobs before writing anything.
+2. Match candidate jobs by `period` plus Telegram target. Prefer an exact match on launcher script and `deliver` target.
+3. Build a deterministic launcher path under `$HERMES_HOME/scripts/` using the resolved period and delivery target so different chats/topics do not collide.
+4. Write the launcher so it only executes the installed skill script with the resolved `--period` value.
+5. Mark the launcher executable.
+6. If an exact job already exists for the same `period` and Telegram target, update that job instead of creating a duplicate.
+7. If a matching job exists but the request changes target or period, update the job and rewrite the launcher name/path so the runtime state stays deterministic.
+8. Create or update the Hermes cron job in `no_agent` mode with that launcher and the resolved `deliver` target.
+9. Verify success by checking the stored cron job definition after creation/update.
+
+Pause/resume/remove workflow:
+
+1. Inspect existing cron jobs first.
+2. Match the target job by `period` and Telegram target when available; otherwise fall back to the deterministic launcher/job naming pattern.
+3. For `pause`, pause the matched job.
+4. For `resume`, resume the matched job.
+5. For `remove`, remove the matched job and delete the matching launcher only if no remaining cron job references it.
+6. Verify the final state after the lifecycle action.
+
+The launcher creation is an implementation detail. The user should not be asked to create or edit launcher files manually.
 
 Launcher pattern:
 
@@ -144,13 +214,19 @@ Cron delivery example:
 
 ```bash
 hermes cron create "0 7 * * *" \
-  --name "Habr daily digest" \
-  --script "habr_digest_daily.sh" \
+  --name "Habr daily digest -> telegram:<chat-id>:<thread-id>" \
+  --script "habr_digest_daily__chat_<chat-id>__thread_<thread-id>.sh" \
   --no-agent \
   --deliver "telegram:<chat-id>:<thread-id>"
 ```
 
 For chats without topics, omit the final `:<thread-id>`.
+
+Launcher naming example:
+
+```text
+$HERMES_HOME/scripts/habr_digest_daily__chat_<chat-id>__thread_<thread-id-or-root>.sh
+```
 
 Recommended schedules:
 
@@ -169,6 +245,7 @@ Recommended schedules:
 7. The output is standard Markdown because Hermes Telegram gateway converts it to Telegram MarkdownV2. Do not replace it with raw Telegram MarkdownV2 unless actual gateway delivery is tested.
 8. Do not hard-truncate the final message; it can break links or formatting. Shorten descriptions and fail loudly if the message still cannot fit.
 9. Direct Telegram Bot API sending does not belong in this community skill. Use Hermes gateway delivery instead.
+10. Telegram link-preview suppression is a gateway/platform concern, not a skill concern. In Hermes, the Telegram adapter only disables previews when `telegram.disable_link_previews: true` is set in gateway config. The skill's Markdown output alone cannot force cron delivery to suppress previews.
 
 ## Verification
 

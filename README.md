@@ -67,10 +67,19 @@ The skill itself does not require a Telegram bot token. Telegram credentials bel
 
 ### From this GitHub tap
 
+Add the tap:
+
 ```bash
 hermes skills tap add Pro100x3mal/hermes-skill-habr-digest
-hermes skills install habr-digest
 ```
+
+Install with the deterministic full identifier:
+
+```bash
+hermes skills install Pro100x3mal/hermes-skill-habr-digest/skills/habr-digest
+```
+
+Why not `hermes skills install habr-digest` here? Because short-name resolution for third-party taps has been observed to hang on some Hermes versions. The full identifier works reliably and is the safer published instruction.
 
 Verify that Hermes sees it:
 
@@ -123,8 +132,52 @@ In a Hermes session:
 or ask naturally, for example:
 
 ```text
-Create cron jobs for the Habr digest using the habr-digest skill.
+Запусти habr digest daily в 07:00 с отправкой в telegram chatID <chat-id> threadID <thread-id>.
 ```
+
+### Natural-language triggers for agents
+
+The skill is designed so an agent can treat Habr digest scheduling as a lifecycle task, not as a manual file-editing exercise.
+
+Typical user intents:
+
+- `create`: start a new digest job;
+- `update`: change schedule, period, or delivery target;
+- `pause`: temporarily stop a digest job;
+- `resume`: re-enable a paused digest job;
+- `remove`: permanently stop and delete a digest job.
+
+Example trigger phrases:
+
+```text
+Create:
+- Запусти habr digest daily в 07:00 с отправкой в telegram chatID <chat-id> threadID <thread-id>.
+- Создай еженедельный Habr digest по понедельникам в 07:00 и отправляй в этот топик.
+
+Update:
+- Перенеси daily digest с 07:00 на 08:30.
+- Обнови weekly digest: отправляй в chatID <chat-id> threadID <thread-id>.
+- Смени monthly digest на расписание 2 8 1 * *.
+
+Pause / resume:
+- Поставь weekly Habr digest на паузу.
+- Возобнови monthly Habr digest.
+
+Remove:
+- Останови daily Habr digest для этого топика.
+- Удали weekly Habr digest из telegram chatID <chat-id> threadID <thread-id>.
+```
+
+Expected agent behavior:
+
+1. Parse intent, period, schedule, and delivery target from the prompt.
+2. Ask at most one precise follow-up question if one required field is missing.
+3. Inspect existing cron jobs before creating anything.
+4. Create or update a deterministic launcher under `$HERMES_HOME/scripts/`.
+5. Create, edit, pause, resume, or remove the Hermes cron job in `no_agent` mode.
+6. Verify the resulting job state instead of assuming success.
+
+The user should not be asked to create launcher files manually.
 
 ## Scheduled delivery with Hermes cron
 
@@ -136,7 +189,7 @@ Habr skill script -> stdout -> Hermes cron no_agent -> Hermes gateway delivery
 
 This keeps Telegram credentials and delivery targets out of the community skill.
 
-### Is a launcher under `~/.hermes/scripts/` required?
+### Is a launcher under `$HERMES_HOME/scripts/` required?
 
 For `no_agent` cron jobs, yes — with the current Hermes cron runner.
 
@@ -148,17 +201,29 @@ So the installed skill script is the real implementation:
 $HERMES_HOME/skills/habr-digest/scripts/habr_digest.py
 ```
 
-and the cron launcher is just a small scheduler entrypoint:
+and the cron launcher is just a small scheduler entrypoint, for example:
 
 ```text
-$HERMES_HOME/scripts/habr_digest_daily.sh
+$HERMES_HOME/scripts/habr_digest_daily__chat_<chat-id>__thread_<thread-id>.sh
 ```
 
 It contains no secrets and no Telegram target.
 
-### Daily launcher example
+### Launcher rule for scheduled no-agent jobs
 
-Create `$HERMES_HOME/scripts/habr_digest_daily.sh`:
+Agents should create deterministic launcher names so different chats/topics do not collide:
+
+```text
+$HERMES_HOME/scripts/habr_digest_<period>__chat_<chat-id>__thread_<thread-id-or-root>.sh
+```
+
+Example:
+
+```text
+$HERMES_HOME/scripts/habr_digest_daily__chat_<chat-id>__thread_<thread-id>.sh
+```
+
+Launcher content example:
 
 ```bash
 #!/usr/bin/env bash
@@ -171,7 +236,7 @@ exec python3 "$HERMES_HOME/skills/habr-digest/scripts/habr_digest.py" --period d
 Make it executable:
 
 ```bash
-chmod +x ~/.hermes/scripts/habr_digest_daily.sh
+chmod +x $HERMES_HOME/scripts/habr_digest_daily__chat_<chat-id>__thread_<thread-id>.sh
 ```
 
 Weekly/monthly launchers are identical except for `--period weekly` and `--period monthly`.
@@ -186,35 +251,70 @@ Weekly:  1 7 * * 1
 Monthly: 2 7 1 * *
 ```
 
+Recommended deterministic job-name pattern:
+
+```text
+Habr <period> digest -> telegram:<chat-id>:<thread-id-or-root>
+```
+
 Create jobs:
 
 ```bash
 hermes cron create "0 7 * * *" \
-  --name "Habr daily digest" \
-  --script "habr_digest_daily.sh" \
+  --name "Habr daily digest -> telegram:<chat-id>:<thread-id>" \
+  --script "habr_digest_daily__chat_<chat-id>__thread_<thread-id>.sh" \
   --no-agent \
   --deliver "telegram:<chat-id>:<thread-id>"
 
 hermes cron create "1 7 * * 1" \
-  --name "Habr weekly digest" \
-  --script "habr_digest_weekly.sh" \
+  --name "Habr weekly digest -> telegram:<chat-id>:<thread-id>" \
+  --script "habr_digest_weekly__chat_<chat-id>__thread_<thread-id>.sh" \
   --no-agent \
   --deliver "telegram:<chat-id>:<thread-id>"
 
 hermes cron create "2 7 1 * *" \
-  --name "Habr monthly digest" \
-  --script "habr_digest_monthly.sh" \
+  --name "Habr monthly digest -> telegram:<chat-id>:<thread-id>" \
+  --script "habr_digest_monthly__chat_<chat-id>__thread_<thread-id>.sh" \
   --no-agent \
   --deliver "telegram:<chat-id>:<thread-id>"
 ```
 
-For chats without forum topics, omit the final `:<thread-id>`.
+For chats without forum topics, omit the final `:<thread-id>` from `--deliver` and use `thread_root` in the deterministic launcher/job naming.
+
+Update an existing job instead of creating duplicates when the same digest already exists for the same period and target:
+
+```bash
+hermes cron edit <job-id> \
+  --schedule "30 8 * * *" \
+  --name "Habr daily digest -> telegram:<chat-id>:<thread-id>" \
+  --script "habr_digest_daily__chat_<chat-id>__thread_<thread-id>.sh" \
+  --no-agent \
+  --deliver "telegram:<chat-id>:<thread-id>"
+```
+
+Pause, resume, and remove examples:
+
+```bash
+hermes cron pause <job-id>
+hermes cron resume <job-id>
+hermes cron remove <job-id>
+```
+
+Before destructive removal, inspect existing jobs first:
+
+```bash
+hermes cron list --all
+```
 
 ### Telegram link previews
 
 This skill no longer calls Telegram Bot API directly, so link preview behavior is controlled by the Hermes Telegram gateway adapter. Hermes supports disabling previews through Telegram adapter config (`disable_link_previews`). Verify the actual rendered target message after enabling scheduled delivery.
 
 ## Update
+
+There are two different update paths here. Do not confuse them.
+
+### 1. Update the installed skill package
 
 Check for updates:
 
@@ -234,7 +334,67 @@ If installed from a tap and the tap source changes, make sure the tap is still c
 hermes skills tap list
 ```
 
-## Uninstall
+### 2. Update an already configured digest job
+
+This is not a skill-package update. It is a cron lifecycle update.
+
+Typical natural-language requests:
+
+```text
+- Перенеси daily digest на 08:30.
+- Смени weekly digest на другой telegram thread.
+- Обнови monthly digest и отправляй в этот чат.
+```
+
+Expected agent action:
+
+1. Inspect existing cron jobs.
+2. Find the matching digest by `period` and target.
+3. Preserve unchanged fields.
+4. Rewrite launcher/job naming if target or period changes.
+5. Run `hermes cron edit ...` instead of creating a duplicate job.
+6. Verify the stored job definition afterward.
+
+
+## Stop or uninstall
+
+Three different operations exist here. They are not the same.
+
+### 1. Stop one digest job temporarily
+
+Natural-language examples:
+
+```text
+- Поставь daily Habr digest на паузу.
+- Pause weekly Habr digest for this topic.
+```
+
+CLI action:
+
+```bash
+hermes cron list --all
+hermes cron pause <job-id>
+```
+
+### 2. Stop one digest job permanently
+
+Natural-language examples:
+
+```text
+- Останови daily Habr digest для этого топика.
+- Удали weekly Habr digest из telegram chatID <chat-id> threadID <thread-id>.
+```
+
+CLI action:
+
+```bash
+hermes cron list --all
+hermes cron remove <job-id>
+```
+
+Delete the matching launcher only if no remaining cron job references it.
+
+### 3. Uninstall the skill package itself
 
 Remove the installed skill:
 
@@ -248,14 +408,12 @@ If you added this repository as a tap and no longer need it, remove the tap as w
 hermes skills tap remove Pro100x3mal/hermes-skill-habr-digest
 ```
 
-Then remove local launchers and cron jobs you created, for example:
+Then remove any unreferenced local launchers, for example:
 
 ```bash
-rm -f ~/.hermes/scripts/habr_digest_daily.sh
-rm -f ~/.hermes/scripts/habr_digest_weekly.sh
-rm -f ~/.hermes/scripts/habr_digest_monthly.sh
-hermes cron list
-hermes cron remove <job-id>
+rm -f "$HERMES_HOME/scripts/habr_digest_daily__chat_<chat-id>__thread_<thread-id>.sh"
+rm -f "$HERMES_HOME/scripts/habr_digest_weekly__chat_<chat-id>__thread_<thread-id>.sh"
+rm -f "$HERMES_HOME/scripts/habr_digest_monthly__chat_<chat-id>__thread_<thread-id>.sh"
 ```
 
 Do not remove Hermes Telegram credentials unless they were created only for this workflow.
@@ -299,7 +457,7 @@ Check direct connectivity from the host:
 ```bash
 curl -L --connect-timeout 10 --max-time 40 \
   -A 'Mozilla/5.0 (compatible; HermesHabrDigest/1.0)' \
-  https://habr.com/sitemap_articles1.xml -o /tmp/habr_sitemap.xml
+  https://habr.com/sitemap_articles1.xml -o "${TMPDIR:-/tmp}/habr_sitemap.xml"
 ```
 
 If this times out, the digest cannot run from that host until network access to `habr.com:443` works.

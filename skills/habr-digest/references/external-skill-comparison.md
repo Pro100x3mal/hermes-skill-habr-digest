@@ -1,6 +1,6 @@
 # External implementation comparison notes
 
-Source compared during development: an earlier `Pro100x3mal/hermes-skill-habr-digest` implementation.
+Source compared during development: an earlier external implementation of the same skill family.
 
 ## Durable lessons
 
