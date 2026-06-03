@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import re
 import sys
 import time
@@ -32,6 +33,12 @@ MAX_RETRIES = 4
 WORKERS = 64
 RETRY_WORKERS = 16
 MESSAGE_LIMIT = 3900
+# Habr sitemap <lastmod> is not publication time and is not a completeness
+# guarantee. Use sitemap as an ID index, then over-collect recent article IDs
+# before the authoritative API timePublished filter.
+ARTICLE_IDS_PER_DAY_LOOKBACK = 500
+MIN_ARTICLE_ID_LOOKBACK = 1500
+MAX_ARTICLE_ID_LOOKBACK = 20000
 SEP = "➖➖➖➖➖➖➖➖➖➖➖➖"
 RANKS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -160,22 +167,47 @@ def md_link_text(value: str) -> str:
     return value.replace("[", "(").replace("]", ")")
 
 
+def _article_id_lookback(fetch_start_utc: datetime) -> int:
+    """Return a conservative article-id span for sitemap over-collection.
+
+    Habr article IDs are sparse and sitemap ``lastmod`` can be older than the
+    requested publication window. The safe pattern is: collect a recent ID band,
+    fetch article API records, then filter by API ``timePublished``.
+    """
+    now_utc = datetime.now(timezone.utc)
+    if fetch_start_utc.tzinfo is None:
+        fetch_start_utc = fetch_start_utc.replace(tzinfo=timezone.utc)
+    days = max(1, math.ceil((now_utc - fetch_start_utc.astimezone(timezone.utc)).total_seconds() / 86400))
+    return min(
+        MAX_ARTICLE_ID_LOOKBACK,
+        max(MIN_ARTICLE_ID_LOOKBACK, days * ARTICLE_IDS_PER_DAY_LOOKBACK),
+    )
+
+
 def fetch_candidates(fetch_start_utc: datetime) -> list[Candidate]:
     root = ET.fromstring(request_text(SITEMAP_URL))
-    candidates: list[Candidate] = []
+    parsed: list[Candidate] = []
+    newest_id = 0
     for node in root.findall("sm:url", NS):
         loc = (node.findtext("sm:loc", namespaces=NS) or "").strip()
         match = ARTICLE_ID_RE.search(loc)
         if not match:
             continue
+        article_id = match.group(1)
+        newest_id = max(newest_id, int(article_id))
         lastmod_raw = (node.findtext("sm:lastmod", namespaces=NS) or "").strip()
-        if not lastmod_raw:
-            continue
-        lastmod = parse_iso(lastmod_raw)
-        if lastmod >= fetch_start_utc:
-            candidates.append(Candidate(match.group(1), lastmod))
-    by_id = {item.article_id: item for item in candidates}
-    return sorted(by_id.values(), key=lambda item: (item.lastmod, int(item.article_id)), reverse=True)
+        try:
+            lastmod = parse_iso(lastmod_raw) if lastmod_raw else datetime.fromtimestamp(0, timezone.utc)
+        except ValueError:
+            lastmod = datetime.fromtimestamp(0, timezone.utc)
+        parsed.append(Candidate(article_id, lastmod))
+
+    if not parsed or newest_id <= 0:
+        return []
+
+    min_article_id = newest_id - _article_id_lookback(fetch_start_utc)
+    by_id = {item.article_id: item for item in parsed if int(item.article_id) >= min_article_id}
+    return sorted(by_id.values(), key=lambda item: int(item.article_id), reverse=True)
 
 
 def fetch_article(candidate: Candidate) -> Article | None | object:
@@ -367,8 +399,11 @@ def select_digest(period: str, now_msk: datetime) -> tuple[list[Article], Articl
 
     summary_pool = [item for item in articles if summary_start <= item.published_msk <= now_msk]
     top5 = rank_articles(summary_pool)[:5]
-    if not top5:
-        raise RuntimeError(f"no articles in {period} summary window")
+    if len(top5) < len(RANKS):
+        raise RuntimeError(
+            f"fewer than 5 articles in {period} summary window: "
+            f"{len(top5)} fetched from {len(summary_pool)} matching API records"
+        )
 
     top = None
     trend = None

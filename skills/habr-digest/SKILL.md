@@ -1,7 +1,7 @@
 ---
 name: habr-digest
 description: Build Habr top-by-views digest messages.
-version: 1.2.0
+version: 1.2.1
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -64,7 +64,7 @@ The script always writes the user-facing digest to stdout. Diagnostics go to std
 ## Quick Reference
 
 - Script: `${HERMES_SKILL_DIR}/scripts/habr_digest.py`
-- Habr sitemap: `https://habr.com/sitemap_articles1.xml`
+- Habr sitemap: `https://habr.com/sitemap_articles1.xml` used as an article-ID index, not as a publication-time filter
 - Article API: `https://habr.com/kek/v2/articles/<id>/?fl=ru&hl=ru`
 - Output: one standard-Markdown message on stdout
 - Main ranking: top-5 by `statistics.readingCount`
@@ -79,13 +79,13 @@ The script always writes the user-facing digest to stdout. Diagnostics go to std
 ## Procedure
 
 1. Compute `now` and period windows in Europe/Moscow time, fixed UTC+03:00.
-2. Fetch article candidates only from `sitemap_articles1.xml`.
-3. Use sitemap `lastmod` only as a discovery filter for the widest required window.
+2. Fetch article candidates from `sitemap_articles1.xml` as a recent article-ID band.
+3. Do not use sitemap `lastmod` as a completeness/publication filter.
 4. Fetch every candidate through the per-article API.
 5. Keep only records with `postType == "article"`.
-6. Filter final pools by `timePublished`, not by sitemap `lastmod`.
+6. Filter final pools by API `timePublished`, not by sitemap `lastmod`.
 7. Sort the main pool by views descending, then score, comments, publication time, and id.
-8. Render top-5 articles by views.
+8. Render exactly top-5 articles by views; fail hard if the main window has fewer than 5 articles.
 9. For daily and weekly, add two non-duplicate highlight blocks:
    - `🏆 Топ недели/месяца` — highest score in the highlight window, excluding the main top-5.
    - `🔥 Тренд недели/месяца` — highest views in the highlight window, excluding the main top-5 and selected top article.

@@ -9,7 +9,7 @@ The skill collects article candidates from the Habr sitemap, fetches authoritati
 - Generates daily, weekly, and monthly Habr article digest messages.
 - Ranks the main top-5 by `statistics.readingCount` — views, not rating.
 - Uses only:
-  - `https://habr.com/sitemap_articles1.xml` for article discovery;
+  - `https://habr.com/sitemap_articles1.xml` as an article-ID index for over-collection;
   - `https://habr.com/kek/v2/articles/<id>/?fl=ru&hl=ru` for title, date, views, score, description, and post type.
 - Filters records with `postType == "article"`.
 - Renders standard Markdown suitable for Hermes Telegram gateway conversion to MarkdownV2.
@@ -481,7 +481,7 @@ This is controlled by the Hermes Telegram adapter, not by this skill. Enable/ver
 
 ### Digest misses articles
 
-The sitemap `lastmod` is only a discovery filter. Final windows must be filtered by API `timePublished`. Do not replace the collection path with Habr `top/*` pages or search results.
+The sitemap `lastmod` is not a completeness or publication-time filter. Collect a recent article-ID band from the sitemap, fetch article API records, then filter final windows by API `timePublished`. Do not replace the collection path with Habr `top/*` pages or search results. If the required main window has fewer than five articles, fail hard instead of sending a shortened top block.
 
 ## Contributing
 
