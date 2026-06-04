@@ -39,6 +39,10 @@ MESSAGE_LIMIT = 3900
 ARTICLE_IDS_PER_DAY_LOOKBACK = 500
 MIN_ARTICLE_ID_LOOKBACK = 1500
 MAX_ARTICLE_ID_LOOKBACK = 20000
+# Scan above the newest sitemap ID because Habr's sitemap can lag behind
+# articles that already exist in the article API. These candidates are cheap
+# placeholders; fetch_article() is the authoritative existence/time filter.
+DIRECT_ARTICLE_ID_AHEAD = 1500
 SEP = "➖➖➖➖➖➖➖➖➖➖➖➖"
 RANKS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -206,7 +210,11 @@ def fetch_candidates(fetch_start_utc: datetime) -> list[Candidate]:
         return []
 
     min_article_id = newest_id - _article_id_lookback(fetch_start_utc)
+    max_article_id = newest_id + DIRECT_ARTICLE_ID_AHEAD
     by_id = {item.article_id: item for item in parsed if int(item.article_id) >= min_article_id}
+    zero_lastmod = datetime.fromtimestamp(0, timezone.utc)
+    for article_id in range(newest_id + 1, max_article_id + 1):
+        by_id.setdefault(str(article_id), Candidate(str(article_id), zero_lastmod))
     return sorted(by_id.values(), key=lambda item: int(item.article_id), reverse=True)
 
 

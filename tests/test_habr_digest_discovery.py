@@ -54,6 +54,30 @@ def test_fetch_candidates_overcollects_recent_article_ids_even_when_lastmod_is_o
     assert str(newest - 20_000) not in ids, "ancient article IDs should stay outside the over-collection range"
 
 
+def test_fetch_candidates_scans_above_stale_sitemap_max_id(monkeypatch):
+    sitemap_max = 900_000
+    now = datetime(2026, 6, 4, tzinfo=timezone.utc)
+    xml = sitemap_xml(
+        [
+            (sitemap_max, now - timedelta(days=1)),
+            (sitemap_max - 3, now - timedelta(days=90)),
+        ]
+    )
+    monkeypatch.setattr(habr_digest, "request_text", lambda url: xml)
+    monkeypatch.setattr(habr_digest, "MIN_ARTICLE_ID_LOOKBACK", 3)
+    monkeypatch.setattr(habr_digest, "MAX_ARTICLE_ID_LOOKBACK", 3)
+    monkeypatch.setattr(habr_digest, "ARTICLE_IDS_PER_DAY_LOOKBACK", 1)
+    monkeypatch.setattr(habr_digest, "DIRECT_ARTICLE_ID_AHEAD", 4)
+
+    candidates = habr_digest.fetch_candidates(now - timedelta(days=1))
+    ids = [item.article_id for item in candidates]
+
+    assert str(sitemap_max + 4) in ids
+    assert str(sitemap_max + 1) in ids
+    assert str(sitemap_max) in ids
+    assert str(sitemap_max - 3) in ids
+
+
 def test_select_digest_fails_when_main_window_has_fewer_than_five_articles(monkeypatch):
     now_msk = datetime(2026, 6, 3, 7, 0, tzinfo=habr_digest.MSK)
     article = habr_digest.Article(
